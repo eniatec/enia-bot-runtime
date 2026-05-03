@@ -45,11 +45,22 @@ type MessageEvent struct {
 	ContactID      int64          `json:"contact_id"`
 	MessageID      string         `json:"message_id"`
 	MessageContent string         `json:"message_content"`
+	Attachments    []Attachment   `json:"attachments,omitempty"`
 	ApiKey         string         `json:"api_key"`
 	OutgoingURL    string         `json:"outgoing_url"`
 	BotConfig      BotConfig      `json:"bot_config"`
 	PostbackURL    string         `json:"postback_url"`
 	Metadata       map[string]any `json:"metadata,omitempty"`
+}
+
+// Attachment is a binary payload (audio/image/video/file) carried alongside
+// a message's text. The CRM populates it from message.attachments so the
+// AI Processor can transcribe audio (or otherwise process the file) — Bot
+// Runtime forwards it as an A2A FilePart with bytes (base64).
+type Attachment struct {
+	Name        string `json:"name"`
+	ContentType string `json:"content_type"`
+	Data        string `json:"data"` // base64 (RFC 4648, no newlines)
 }
 
 // BotConfig carries per-bot runtime configuration provided by the caller.

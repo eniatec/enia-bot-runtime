@@ -48,6 +48,22 @@ func (a *aiAdapter) Call(ctx context.Context, req *model.A2ARequest) (*model.Nor
 	// Use the full outgoing_url provided by the CRM (already contains the agent ID)
 	url := req.OutgoingURL
 
+	// Build the message parts. The first part is always the text buffer
+	// (may be empty when the user sent only audio); each attachment is a
+	// FilePart so the AI Processor's extract_files_from_message picks it
+	// up and feeds it through process_files (transcription, etc).
+	parts := []model.JSONRPCPart{{Type: "text", Text: req.Message}}
+	for _, att := range req.Attachments {
+		parts = append(parts, model.JSONRPCPart{
+			Type: "file",
+			File: &model.JSONRPCFile{
+				Name:     att.Name,
+				MimeType: att.ContentType,
+				Bytes:    att.Data,
+			},
+		})
+	}
+
 	// Build JSON-RPC 2.0 envelope
 	rpcReq := model.JSONRPCRequest{
 		JSONRPC: "2.0",
@@ -57,10 +73,8 @@ func (a *aiAdapter) Call(ctx context.Context, req *model.A2ARequest) (*model.Nor
 			ContextID: fmt.Sprintf("%d", req.ConversationID),
 			UserID:    fmt.Sprintf("%d", req.ContactID),
 			Message: model.JSONRPCMessage{
-				Role: "user",
-				Parts: []model.JSONRPCPart{
-					{Type: "text", Text: req.Message},
-				},
+				Role:  "user",
+				Parts: parts,
 			},
 			Metadata: nonNilMetadata(req.Metadata),
 		},
@@ -105,14 +119,48 @@ func (a *aiAdapter) Call(ctx context.Context, req *model.A2ARequest) (*model.Nor
 	}
 
 	content := extractResponseText(&a2aResp)
+	audioURL, audioMime, audioBytes, replacesText := extractResponseAudio(&a2aResp)
 
 	slog.Info("pipeline.ai.http.completed",
 		"contact_id", req.ContactID,
 		"conversation_id", req.ConversationID,
 		"duration_ms", time.Since(start).Milliseconds(),
+		"audio_url", audioURL != "",
+		"audio_bytes", audioBytes != "",
+		"replaces_text", replacesText,
 	)
 
-	return &model.NormalizedResponse{Content: content}, nil
+	return &model.NormalizedResponse{
+		Content:           content,
+		AudioURL:          audioURL,
+		AudioMimeType:     audioMime,
+		AudioData:         audioBytes,
+		AudioReplacesText: replacesText,
+	}, nil
+}
+
+// extractResponseAudio walks artifacts for the first FilePart with audio
+// content. Returns (uri, mimeType, base64Bytes, replacesText). `uri` is
+// preferred over `bytes`; `replacesText` is true when the audio is the
+// canonical reply (mirror modality — text dispatch should be skipped).
+func extractResponseAudio(resp *model.A2AResponse) (string, string, string, bool) {
+	if resp.Result == nil {
+		return "", "", "", false
+	}
+	for _, artifact := range resp.Result.Artifacts {
+		for _, part := range artifact.Parts {
+			if part.Type != "file" || part.File == nil {
+				continue
+			}
+			if part.File.Uri != "" {
+				return part.File.Uri, part.File.MimeType, "", part.File.ReplacesText
+			}
+			if part.File.Bytes != "" {
+				return "", part.File.MimeType, part.File.Bytes, part.File.ReplacesText
+			}
+		}
+	}
+	return "", "", "", false
 }
 
 // extractResponseText extracts the text content from the A2A JSON-RPC response.

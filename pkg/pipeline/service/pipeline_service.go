@@ -38,6 +38,7 @@ type pipelineEntry struct {
 	outgoingURL string             // carries OutgoingURL (full A2A endpoint) from MessageEvent to AI stage
 	apiKey      string             // carries ApiKey from MessageEvent to AI stage
 	metadata    map[string]any     // carries Metadata from MessageEvent to AI stage (for tools context)
+	attachments []model.Attachment // accumulated across the debounce window — passed to AI as FileParts
 }
 
 type pipelineService struct {
@@ -167,6 +168,7 @@ func (s *pipelineService) startDebounce(ctx context.Context, event *model.Messag
 		outgoingURL: event.OutgoingURL,
 		apiKey:      event.ApiKey,
 		metadata:    event.Metadata,
+		attachments: append([]model.Attachment(nil), event.Attachments...),
 	})
 
 	if err := s.debounce.Start(ctx, event.ContactID, event.ConversationID, event.MessageContent, event.BotConfig); err != nil {
@@ -212,6 +214,7 @@ func (s *pipelineService) skipDebounce(ctx context.Context, event *model.Message
 		outgoingURL: event.OutgoingURL,
 		apiKey:      event.ApiKey,
 		metadata:    event.Metadata,
+		attachments: append([]model.Attachment(nil), event.Attachments...),
 	})
 
 	// debounce.Start appends to buffer; DebounceTime=0 means no timer (Story 2.1).
@@ -248,6 +251,21 @@ func (s *pipelineService) resetDebounce(ctx context.Context, event *model.Messag
 	if err := s.debounce.Reset(ctx, event.ContactID, event.ConversationID, event.MessageContent, event.BotConfig); err != nil {
 		return fmt.Errorf("pipeline.debounce.reset: %w", err)
 	}
+
+	// Append the new event's attachments to the in-memory pipelineEntry —
+	// the text buffer is already accumulated by debounce.Reset above, but
+	// attachments live only in memory (we don't push base64 audio bytes
+	// into Redis), so we append here ourselves.
+	if len(event.Attachments) > 0 {
+		key := pairKey(event.ContactID, event.ConversationID)
+		if v, ok := s.entries.Load(key); ok {
+			if entry, ok := v.(pipelineEntry); ok {
+				entry.attachments = append(entry.attachments, event.Attachments...)
+				s.entries.Store(key, entry)
+			}
+		}
+	}
+
 	slog.Info("pipeline.debounce.reset",
 		"contact_id", event.ContactID,
 		"conversation_id", event.ConversationID,
@@ -343,16 +361,27 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 	)
 	start := time.Now()
 
-	// Retrieve outgoing_url, api_key and metadata from the pipeline entry.
+	// Retrieve outgoing_url, api_key, metadata and attachments from the pipeline entry.
 	key := pairKey(contactID, conversationID)
 	var outgoingURL, apiKey string
 	var metadata map[string]any
+	var attachments []model.Attachment
 	if v, ok := s.entries.Load(key); ok {
 		if entry, ok := v.(pipelineEntry); ok {
 			outgoingURL = entry.outgoingURL
 			apiKey = entry.apiKey
 			metadata = entry.metadata
+			attachments = entry.attachments
 		}
+	}
+
+	a2aAttachments := make([]aiModel.A2AAttachment, 0, len(attachments))
+	for _, att := range attachments {
+		a2aAttachments = append(a2aAttachments, aiModel.A2AAttachment{
+			Name:        att.Name,
+			ContentType: att.ContentType,
+			Data:        att.Data,
+		})
 	}
 
 	resp, err := s.aiAdapter.Call(ctx, &aiModel.A2ARequest{
@@ -361,6 +390,7 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 		ConversationID: conversationID,
 		ApiKey:         apiKey,
 		Message:        buffer,
+		Attachments:    a2aAttachments,
 		Metadata:       metadata,
 	})
 	if err != nil {
@@ -424,28 +454,37 @@ func (s *pipelineService) launchDispatchStage(
 	cfg            model.BotConfig,
 	postbackURL    string,
 ) {
-	go s.runDispatchStage(ctx, contactID, conversationID, resp.Content, cfg, postbackURL)
+	go s.runDispatchStage(ctx, contactID, conversationID,
+		resp.Content, resp.AudioURL, resp.AudioMimeType, resp.AudioData, resp.AudioReplacesText,
+		cfg, postbackURL)
 }
 
 // runDispatchStage is the dispatch stage goroutine body. ctx is pipelineEntry.ctx — cancelled by
 // Process when a new message arrives for the same pair.
 func (s *pipelineService) runDispatchStage(
-	ctx            context.Context,
-	contactID      int64,
-	conversationID int64,
-	content        string,
-	cfg            model.BotConfig,
-	postbackURL    string,
+	ctx               context.Context,
+	contactID         int64,
+	conversationID    int64,
+	content           string,
+	audioURL          string,
+	audioMime         string,
+	audioData         string,
+	audioReplacesText bool,
+	cfg               model.BotConfig,
+	postbackURL       string,
 ) {
 	defer s.recoverPipeline(contactID, conversationID)
 
 	slog.Info("pipeline.dispatch.started",
 		"contact_id",      contactID,
 		"conversation_id", conversationID,
+		"has_audio",       audioURL != "" || audioData != "",
+		"replaces_text",   audioReplacesText,
 	)
 	start := time.Now()
 
-	err := s.dispatchEng.Dispatch(ctx, contactID, conversationID, content, cfg, postbackURL)
+	err := s.dispatchEng.Dispatch(ctx, contactID, conversationID,
+		content, audioURL, audioMime, audioData, audioReplacesText, cfg, postbackURL)
 	if err != nil {
 		switch {
 		case errors.Is(err, brtErrors.ErrDispatchInterrupted):

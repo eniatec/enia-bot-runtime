@@ -21,20 +21,30 @@ import (
 // Swap the dispatch backend by providing a different implementation at main.go wiring.
 type DispatchEngine interface {
 	Dispatch(
-		ctx            context.Context,
-		contactID      int64,
-		conversationID int64,
-		content        string,
-		cfg            model.BotConfig,
-		postbackURL    string,
+		ctx               context.Context,
+		contactID         int64,
+		conversationID    int64,
+		content           string,
+		audioURL          string,
+		audioMime         string,
+		audioData         string,
+		audioReplacesText bool,
+		cfg               model.BotConfig,
+		postbackURL       string,
 	) error
 }
 
 // postbackRequest is the JSON body for each HTTP POST to the postback endpoint.
+// AudioURL is preferred over AudioData (smaller payload). The CRM postback
+// handler downloads the URL or decodes the base64 fallback to attach to the
+// outgoing Message.
 type postbackRequest struct {
-	Content     string `json:"content"`
-	MessageType string `json:"message_type"`
-	ContentType string `json:"content_type"`
+	Content       string `json:"content,omitempty"`
+	MessageType   string `json:"message_type"`
+	ContentType   string `json:"content_type"`
+	AudioURL      string `json:"audio_url,omitempty"`
+	AudioMimeType string `json:"audio_mime_type,omitempty"`
+	AudioData     string `json:"audio_data,omitempty"`
 }
 
 type dispatchEngineImpl struct {
@@ -56,52 +66,85 @@ func NewDispatchEngine(secret string) DispatchEngine {
 }
 
 func (d *dispatchEngineImpl) Dispatch(
-	ctx            context.Context,
-	contactID      int64,
-	conversationID int64,
-	content        string,
-	cfg            model.BotConfig,
-	postbackURL    string,
+	ctx               context.Context,
+	contactID         int64,
+	conversationID    int64,
+	content           string,
+	audioURL          string,
+	audioMime         string,
+	audioData         string,
+	audioReplacesText bool,
+	cfg               model.BotConfig,
+	postbackURL       string,
 ) error {
-	parts := segmentContent(content, cfg)
+	hasAudio := audioURL != "" || audioData != ""
+	// In mirror modality (audioReplacesText), the audio IS the reply —
+	// don't also send the text. The text travels as the audio postback's
+	// caption so the CRM still records the words in chat history.
+	skipText := audioReplacesText && hasAudio
 
-	// Prepend signature to the first part (FR-21)
+	parts := segmentContent(content, cfg)
 	if cfg.MessageSignature != "" && len(parts) > 0 {
 		parts[0] = cfg.MessageSignature + parts[0]
 	}
 
 	start := time.Now()
+	textParts := 0
 
-	for i, part := range parts {
-		// Check cancellation BEFORE sending this part
-		select {
-		case <-ctx.Done():
-			slog.Info("pipeline.dispatch.interrupted",
-				"contact_id",      contactID,
-				"conversation_id", conversationID,
-				"parts_sent",      i,
-			)
-			return brtErrors.ErrDispatchInterrupted
-		default:
-		}
-
-		if err := d.sendPart(ctx, postbackURL, part); err != nil {
-			return fmt.Errorf("pipeline.dispatch.send[%d]: %w", i, err)
-		}
-
-		// Apply inter-part delay — skip for the last part (FR-22)
-		if i < len(parts)-1 && cfg.DelayPerCharacter > 0 {
-			delayMs := time.Duration(cfg.DelayPerCharacter*float64(utf8.RuneCountInString(part))) * time.Millisecond
+	if !skipText {
+		for i, part := range parts {
 			select {
 			case <-ctx.Done():
 				slog.Info("pipeline.dispatch.interrupted",
-					"contact_id",      contactID,
+					"contact_id", contactID,
 					"conversation_id", conversationID,
-					"parts_sent",      i+1,
+					"parts_sent", i,
 				)
 				return brtErrors.ErrDispatchInterrupted
-			case <-time.After(delayMs):
+			default:
 			}
+
+			if err := d.sendTextPart(ctx, postbackURL, part); err != nil {
+				return fmt.Errorf("pipeline.dispatch.send[%d]: %w", i, err)
+			}
+			textParts++
+
+			if i < len(parts)-1 && cfg.DelayPerCharacter > 0 {
+				delayMs := time.Duration(cfg.DelayPerCharacter*float64(utf8.RuneCountInString(part))) * time.Millisecond
+				select {
+				case <-ctx.Done():
+					slog.Info("pipeline.dispatch.interrupted",
+						"contact_id", contactID,
+						"conversation_id", conversationID,
+						"parts_sent", i+1,
+					)
+					return brtErrors.ErrDispatchInterrupted
+				case <-time.After(delayMs):
+				}
+			}
+		}
+	}
+
+	// Audio postback — when skipText is true the full text rides along as
+	// the audio's caption so the CRM message history still has it.
+	audioParts := 0
+	if hasAudio {
+		select {
+		case <-ctx.Done():
+			slog.Info("pipeline.dispatch.interrupted_before_audio",
+				"contact_id", contactID, "conversation_id", conversationID)
+			return brtErrors.ErrDispatchInterrupted
+		default:
+		}
+		caption := ""
+		if skipText {
+			caption = content
+		}
+		if err := d.sendAudioPart(ctx, postbackURL, caption, audioURL, audioMime, audioData); err != nil {
+			slog.Error("pipeline.dispatch.audio_failed",
+				"contact_id", contactID, "conversation_id", conversationID, "error", err)
+		} else {
+			audioParts = 1
 		}
 	}
 
@@ -109,18 +152,44 @@ func (d *dispatchEngineImpl) Dispatch(
 		"contact_id",      contactID,
 		"conversation_id", conversationID,
 		"duration_ms",     time.Since(start).Milliseconds(),
-		"parts_total",     len(parts),
+		"parts_total",     textParts+audioParts,
+		"text_parts",      textParts,
+		"audio_parts",     audioParts,
+		"skip_text",       skipText,
 	)
 	return nil
 }
 
-// sendPart sends a single content part to the postback URL.
-func (d *dispatchEngineImpl) sendPart(ctx context.Context, postbackURL, content string) error {
-	body, err := json.Marshal(postbackRequest{
+// sendTextPart sends a single text segment to the postback URL.
+func (d *dispatchEngineImpl) sendTextPart(ctx context.Context, postbackURL, content string) error {
+	return d.send(ctx, postbackURL, postbackRequest{
 		Content:     content,
 		MessageType: "outgoing",
 		ContentType: "text",
 	})
+}
+
+// sendAudioPart sends a synthesized audio reply (URL preferred, base64
+// fallback). `caption` is the text the audio carries — non-empty in
+// mirror modality so the CRM message has the text in its history even
+// though no separate text dispatch was sent.
+func (d *dispatchEngineImpl) sendAudioPart(ctx context.Context, postbackURL, caption, audioURL, audioMime, audioData string) error {
+	mime := audioMime
+	if mime == "" {
+		mime = "audio/mpeg"
+	}
+	return d.send(ctx, postbackURL, postbackRequest{
+		Content:       caption,
+		MessageType:   "outgoing",
+		ContentType:   "audio",
+		AudioURL:      audioURL,
+		AudioMimeType: mime,
+		AudioData:     audioData,
+	})
+}
+
+func (d *dispatchEngineImpl) send(ctx context.Context, postbackURL string, payload postbackRequest) error {
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
@@ -139,7 +208,7 @@ func (d *dispatchEngineImpl) sendPart(ctx context.Context, postbackURL, content 
 		return fmt.Errorf("do: %w", err)
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body) // drain to allow connection reuse
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("status: %d", resp.StatusCode)
