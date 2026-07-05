@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -39,12 +40,21 @@ type DispatchEngine interface {
 // handler downloads the URL or decodes the base64 fallback to attach to the
 // outgoing Message.
 type postbackRequest struct {
-	Content       string `json:"content,omitempty"`
-	MessageType   string `json:"message_type"`
-	ContentType   string `json:"content_type"`
-	AudioURL      string `json:"audio_url,omitempty"`
-	AudioMimeType string `json:"audio_mime_type,omitempty"`
-	AudioData     string `json:"audio_data,omitempty"`
+	Content       string               `json:"content"`
+	MessageType   string               `json:"message_type"`
+	ContentType   string               `json:"content_type"`
+	Attachments   []postbackAttachment `json:"attachments,omitempty"`
+	AudioURL      string               `json:"audio_url,omitempty"`
+	AudioMimeType string               `json:"audio_mime_type,omitempty"`
+	AudioData     string               `json:"audio_data,omitempty"`
+}
+
+// postbackAttachment is a media URL detected in the AI response, sent to the CRM
+// so it can download and render it as real media instead of a plain text link.
+// FileType matches the CRM Attachment enum: image / audio / video / file.
+type postbackAttachment struct {
+	URL      string `json:"url"`
+	FileType string `json:"file_type"`
 }
 
 type dispatchEngineImpl struct {
@@ -83,7 +93,19 @@ func (d *dispatchEngineImpl) Dispatch(
 	// caption so the CRM still records the words in chat history.
 	skipText := audioReplacesText && hasAudio
 
-	parts := segmentContent(content, cfg)
+	// Pull media URLs out of the full response BEFORE segmenting, so media is
+	// not split across text parts. Media is delivered in a single dedicated
+	// postback after the text parts (see below). The CRM also re-detects media
+	// from the text as a fallback, so this is an optimization, not the only path.
+	residual, atts := extractMediaURLs(content)
+
+	parts := segmentContent(residual, cfg)
+	if skipText {
+		// The words travel as the audio postback's caption; no text parts.
+		parts = nil
+	}
+
+	// Prepend signature to the first part (FR-21)
 	if cfg.MessageSignature != "" && len(parts) > 0 {
 		parts[0] = cfg.MessageSignature + parts[0]
 	}
@@ -91,37 +113,55 @@ func (d *dispatchEngineImpl) Dispatch(
 	start := time.Now()
 	textParts := 0
 
-	if !skipText {
-		for i, part := range parts {
+	for i, part := range parts {
+		// Skip empty residual (e.g. response was only a media URL): the media
+		// postback below still runs.
+		if part == "" {
+			continue
+		}
+
+		// Check cancellation BEFORE sending this part
+		select {
+		case <-ctx.Done():
+			slog.Info("pipeline.dispatch.interrupted",
+				"contact_id",      contactID,
+				"conversation_id", conversationID,
+				"parts_sent",      i,
+			)
+			return brtErrors.ErrDispatchInterrupted
+		default:
+		}
+
+		if err := d.sendPart(ctx, postbackURL, part, nil); err != nil {
+			return fmt.Errorf("pipeline.dispatch.send[%d]: %w", i, err)
+		}
+		textParts++
+
+		// Apply inter-part delay — skip for the last part (FR-22)
+		if i < len(parts)-1 && cfg.DelayPerCharacter > 0 {
+			delayMs := time.Duration(cfg.DelayPerCharacter*float64(utf8.RuneCountInString(part))) * time.Millisecond
 			select {
 			case <-ctx.Done():
 				slog.Info("pipeline.dispatch.interrupted",
-					"contact_id", contactID,
+					"contact_id",      contactID,
 					"conversation_id", conversationID,
-					"parts_sent", i,
+					"parts_sent",      i+1,
 				)
 				return brtErrors.ErrDispatchInterrupted
-			default:
+			case <-time.After(delayMs):
 			}
+		}
+	}
 
-			if err := d.sendTextPart(ctx, postbackURL, part); err != nil {
-				return fmt.Errorf("pipeline.dispatch.send[%d]: %w", i, err)
-			}
-			textParts++
-
-			if i < len(parts)-1 && cfg.DelayPerCharacter > 0 {
-				delayMs := time.Duration(cfg.DelayPerCharacter*float64(utf8.RuneCountInString(part))) * time.Millisecond
-				select {
-				case <-ctx.Done():
-					slog.Info("pipeline.dispatch.interrupted",
-						"contact_id", contactID,
-						"conversation_id", conversationID,
-						"parts_sent", i+1,
-					)
-					return brtErrors.ErrDispatchInterrupted
-				case <-time.After(delayMs):
-				}
-			}
+	// Deliver media (if any) in a single dedicated postback after the text.
+	if len(atts) > 0 {
+		select {
+		case <-ctx.Done():
+			return brtErrors.ErrDispatchInterrupted
+		default:
+		}
+		if err := d.sendPart(ctx, postbackURL, "", atts); err != nil {
+			return fmt.Errorf("pipeline.dispatch.send[media]: %w", err)
 		}
 	}
 
@@ -155,18 +195,45 @@ func (d *dispatchEngineImpl) Dispatch(
 		"parts_total",     textParts+audioParts,
 		"text_parts",      textParts,
 		"audio_parts",     audioParts,
+		"attachments",     len(atts),
 		"skip_text",       skipText,
 	)
 	return nil
 }
 
-// sendTextPart sends a single text segment to the postback URL.
-func (d *dispatchEngineImpl) sendTextPart(ctx context.Context, postbackURL, content string) error {
-	return d.send(ctx, postbackURL, postbackRequest{
+// sendPart sends a single content part (and optional media attachments) to the
+// postback URL.
+func (d *dispatchEngineImpl) sendPart(ctx context.Context, postbackURL, content string, atts []postbackAttachment) error {
+	body, err := json.Marshal(postbackRequest{
 		Content:     content,
 		MessageType: "outgoing",
 		ContentType: "text",
+		Attachments: atts,
 	})
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, postbackURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("new_request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if d.secret != "" {
+		req.Header.Set("X-Bot-Runtime-Secret", d.secret)
+	}
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body) // drain to allow connection reuse
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("status: %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // sendAudioPart sends a synthesized audio reply (URL preferred, base64
@@ -273,4 +340,70 @@ func segmentContent(content string, cfg model.BotConfig) []string {
 		}
 	}
 	return merged
+}
+
+// --- Media URL detection ---------------------------------------------------
+//
+// extractMediaURLs pulls media URLs (by file extension) out of the response
+// text and returns the residual text plus the detected attachments.
+//
+// DRIFT WARNING: this MUST stay in sync with the Ruby
+// AgentBots::MediaTypeDetector (app/services/agent_bots/media_type_detector.rb)
+// in evo-ai-crm-community. The CRM re-detects media from text as a fallback, so
+// a divergence degrades gracefully rather than losing media.
+
+var urlRegex = regexp.MustCompile(`https?://[^\s<>"']+`)
+
+// extension -> file_type (matches Attachment enum; document maps to "file").
+var mediaExtToFileType = func() map[string]string {
+	m := map[string]string{}
+	for _, e := range []string{"jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "tiff"} {
+		m[e] = "image"
+	}
+	for _, e := range []string{"mp3", "wav", "ogg", "m4a", "aac", "flac"} {
+		m[e] = "audio"
+	}
+	for _, e := range []string{"mp4", "avi", "mov", "wmv", "flv", "mkv", "webm"} {
+		m[e] = "video"
+	}
+	for _, e := range []string{"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "rtf", "odt"} {
+		m[e] = "file"
+	}
+	return m
+}()
+
+// trailing punctuation often captured when a URL ends a sentence.
+const trailingPunct = ")].,!?;:"
+
+func extractMediaURLs(content string) (residual string, atts []postbackAttachment) {
+	residual = content
+	for _, rawURL := range urlRegex.FindAllString(content, -1) {
+		url := strings.TrimRight(rawURL, trailingPunct)
+		fileType := mediaFileType(url)
+		if fileType == "" {
+			continue // non-media URL stays in the text
+		}
+		atts = append(atts, postbackAttachment{URL: url, FileType: fileType})
+		residual = strings.Replace(residual, rawURL, "", 1)
+	}
+	return strings.TrimSpace(residual), atts
+}
+
+// mediaFileType returns the Attachment file_type for a URL, or "" if not media.
+// Matches the extension in the PATH, ignoring query string / fragment.
+func mediaFileType(url string) string {
+	path := url
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path = path[:i]
+	}
+	seg := path
+	if i := strings.LastIndex(seg, "/"); i >= 0 {
+		seg = seg[i+1:]
+	}
+	dot := strings.LastIndex(seg, ".")
+	if dot < 0 {
+		return ""
+	}
+	ext := strings.ToLower(seg[dot+1:])
+	return mediaExtToFileType[ext]
 }
