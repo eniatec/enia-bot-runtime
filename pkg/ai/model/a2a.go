@@ -8,24 +8,29 @@ type A2ARequest struct {
 	ConversationID int64          // used for contextId in JSON-RPC params
 	ApiKey         string         // used for X-API-Key header (per-event auth)
 	Message        string         // aggregated buffer content (FR-15)
-	Attachments    []A2AAttachment // file payloads (audio/image/etc) accumulated across the debounce window
+	Attachments    []Attachment   // incoming media accumulated across the debounce window
 	Metadata       map[string]any // CRM metadata passed through to processor (tools context)
 }
 
-// A2AAttachment is one file payload to be sent as a JSON-RPC FilePart.
-// Data is base64-encoded.
-type A2AAttachment struct {
-	Name        string
-	ContentType string
-	Data        string
+// Attachment is an incoming media item (image/audio/…) forwarded to the AI
+// Processor as a base64 A2A file part. Union of the two wire shapes: the ENIA
+// CRM hydrates bytes inline (Name/Data), the upstream CRM sends a URL the
+// adapter downloads under the EVO-2178 SSRF guard (URL/FileType). The adapter
+// prefers Data when set.
+type Attachment struct {
+	Name        string // original filename (inline shape)
+	URL         string // downloadable URL (Rails proxy on BACKEND_URL, reachable server-side)
+	ContentType string // e.g. "image/jpeg"
+	FileType    string // CRM file_type: image/audio/video/file
+	Data        string // base64 (RFC 4648, no newlines) — pre-hydrated by the ENIA CRM
 }
 
 // jsonRPCRequest is the JSON-RPC 2.0 envelope sent to AI Processor.
 type JSONRPCRequest struct {
-	JSONRPC string         `json:"jsonrpc"`
-	ID      string         `json:"id"`
-	Method  string         `json:"method"`
-	Params  JSONRPCParams  `json:"params"`
+	JSONRPC string        `json:"jsonrpc"`
+	ID      string        `json:"id"`
+	Method  string        `json:"method"`
+	Params  JSONRPCParams `json:"params"`
 }
 
 type JSONRPCParams struct {
@@ -36,23 +41,22 @@ type JSONRPCParams struct {
 }
 
 type JSONRPCMessage struct {
-	Role  string         `json:"role"`
-	Parts []JSONRPCPart  `json:"parts"`
+	Role  string        `json:"role"`
+	Parts []JSONRPCPart `json:"parts"`
 }
 
 type JSONRPCPart struct {
-	Type string         `json:"type"`
-	Text string         `json:"text,omitempty"`
-	File *JSONRPCFile   `json:"file,omitempty"`
+	Type string       `json:"type"`
+	Text string       `json:"text,omitempty"`
+	File *JSONRPCFile `json:"file,omitempty"`
 }
 
-// JSONRPCFile mirrors the A2A FilePart "file" object — see
-// evo-ai-processor a2a_routes.extract_files_from_message which expects
-// `bytes` (base64) plus `name` and `mimeType`.
+// JSONRPCFile is a base64 file part. Field names/tags match what the AI Processor
+// reads (extract_files_from_message: name / mimeType / bytes).
 type JSONRPCFile struct {
 	Name     string `json:"name,omitempty"`
-	MimeType string `json:"mimeType,omitempty"`
-	Bytes    string `json:"bytes,omitempty"`
+	MimeType string `json:"mimeType"`
+	Bytes    string `json:"bytes"` // base64-encoded content
 }
 
 // A2AResponse is the JSON-RPC 2.0 response from AI Processor.

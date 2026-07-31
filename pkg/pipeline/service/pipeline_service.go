@@ -38,7 +38,7 @@ type pipelineEntry struct {
 	outgoingURL string             // carries OutgoingURL (full A2A endpoint) from MessageEvent to AI stage
 	apiKey      string             // carries ApiKey from MessageEvent to AI stage
 	metadata    map[string]any     // carries Metadata from MessageEvent to AI stage (for tools context)
-	attachments []model.Attachment // accumulated across the debounce window — passed to AI as FileParts
+	attachments []model.Attachment // ENIA inline/base64 media accumulated across the debounce window (never Redis)
 }
 
 type pipelineService struct {
@@ -47,16 +47,16 @@ type pipelineService struct {
 	aiAdapter   aiIface.AIAdapter
 	dispatchEng dispatchIface.DispatchEngine
 	entries     sync.Map      // string → pipelineEntry
-	stopCh      chan struct{}  // closed by Shutdown to stop pollDebounceExpiry
-	stoppedCh   chan struct{}  // closed by pollDebounceExpiry when it exits
+	stopCh      chan struct{} // closed by Shutdown to stop pollDebounceExpiry
+	stoppedCh   chan struct{} // closed by pollDebounceExpiry when it exits
 	stopOnce    sync.Once     // ensures stopCh is closed exactly once
 }
 
 // NewPipelineService constructs the service. Returns interface (GEAR R03).
 func NewPipelineService(
-	repo        repository.PipelineRepository,
-	debounce    debounceIface.DebounceEngine,
-	aiAdapter   aiIface.AIAdapter,
+	repo repository.PipelineRepository,
+	debounce debounceIface.DebounceEngine,
+	aiAdapter aiIface.AIAdapter,
 	dispatchEng dispatchIface.DispatchEngine,
 ) PipelineService {
 	return &pipelineService{
@@ -160,6 +160,7 @@ func (s *pipelineService) Process(ctx context.Context, event *model.MessageEvent
 func (s *pipelineService) startDebounce(ctx context.Context, event *model.MessageEvent) error {
 	pipelineCtx, cancel := context.WithCancel(context.Background())
 	key := pairKey(event.ContactID, event.ConversationID)
+	inlineAtts, urlAtts := splitAttachments(event.Attachments)
 	s.entries.Store(key, pipelineEntry{
 		ctx:         pipelineCtx,
 		cancel:      cancel,
@@ -168,10 +169,10 @@ func (s *pipelineService) startDebounce(ctx context.Context, event *model.Messag
 		outgoingURL: event.OutgoingURL,
 		apiKey:      event.ApiKey,
 		metadata:    event.Metadata,
-		attachments: append([]model.Attachment(nil), event.Attachments...),
+		attachments: inlineAtts,
 	})
 
-	if err := s.debounce.Start(ctx, event.ContactID, event.ConversationID, event.MessageContent, event.BotConfig); err != nil {
+	if err := s.debounce.Start(ctx, event.ContactID, event.ConversationID, event.MessageContent, urlAtts, event.BotConfig); err != nil {
 		cancel()
 		s.entries.Delete(key)
 		return fmt.Errorf("pipeline.debounce.start: %w", err)
@@ -206,6 +207,7 @@ func (s *pipelineService) startDebounce(ctx context.Context, event *model.Messag
 func (s *pipelineService) skipDebounce(ctx context.Context, event *model.MessageEvent) error {
 	pipelineCtx, cancel := context.WithCancel(context.Background())
 	key := pairKey(event.ContactID, event.ConversationID)
+	inlineAtts, urlAtts := splitAttachments(event.Attachments)
 	s.entries.Store(key, pipelineEntry{
 		ctx:         pipelineCtx,
 		cancel:      cancel,
@@ -214,12 +216,12 @@ func (s *pipelineService) skipDebounce(ctx context.Context, event *model.Message
 		outgoingURL: event.OutgoingURL,
 		apiKey:      event.ApiKey,
 		metadata:    event.Metadata,
-		attachments: append([]model.Attachment(nil), event.Attachments...),
+		attachments: inlineAtts,
 	})
 
 	// debounce.Start appends to buffer; DebounceTime=0 means no timer (Story 2.1).
 	if err := s.debounce.Start(ctx, event.ContactID, event.ConversationID,
-		event.MessageContent, event.BotConfig); err != nil {
+		event.MessageContent, urlAtts, event.BotConfig); err != nil {
 		cancel()
 		s.entries.Delete(key)
 		return fmt.Errorf("pipeline.skip_debounce.start: %w", err)
@@ -230,6 +232,18 @@ func (s *pipelineService) skipDebounce(ctx context.Context, event *model.Message
 		cancel()
 		s.entries.Delete(key)
 		return fmt.Errorf("pipeline.skip_debounce.get_buffer: %w", err)
+	}
+
+	// A media read failure must never cost the customer the text reply (EVO-2180):
+	// log it and go on with no attachments.
+	atts, err := s.debounce.GetAttachments(ctx, event.ContactID, event.ConversationID)
+	if err != nil {
+		slog.Warn("pipeline.skip_debounce.get_attachments_failed",
+			"contact_id", event.ContactID,
+			"conversation_id", event.ConversationID,
+			"error", err,
+		)
+		atts = nil
 	}
 
 	newState := &model.PipelineState{Stage: model.StageAI, CreatedAt: time.Now()}
@@ -243,12 +257,13 @@ func (s *pipelineService) skipDebounce(ctx context.Context, event *model.Message
 		"contact_id", event.ContactID,
 		"conversation_id", event.ConversationID,
 	)
-	s.launchAIStage(event.ContactID, event.ConversationID, buffer)
+	s.launchAIStage(event.ContactID, event.ConversationID, buffer, atts)
 	return nil
 }
 
 func (s *pipelineService) resetDebounce(ctx context.Context, event *model.MessageEvent) error {
-	if err := s.debounce.Reset(ctx, event.ContactID, event.ConversationID, event.MessageContent, event.BotConfig); err != nil {
+	inlineAtts, urlAtts := splitAttachments(event.Attachments)
+	if err := s.debounce.Reset(ctx, event.ContactID, event.ConversationID, event.MessageContent, urlAtts, event.BotConfig); err != nil {
 		return fmt.Errorf("pipeline.debounce.reset: %w", err)
 	}
 
@@ -256,11 +271,11 @@ func (s *pipelineService) resetDebounce(ctx context.Context, event *model.Messag
 	// the text buffer is already accumulated by debounce.Reset above, but
 	// attachments live only in memory (we don't push base64 audio bytes
 	// into Redis), so we append here ourselves.
-	if len(event.Attachments) > 0 {
+	if len(inlineAtts) > 0 {
 		key := pairKey(event.ContactID, event.ConversationID)
 		if v, ok := s.entries.Load(key); ok {
 			if entry, ok := v.(pipelineEntry); ok {
-				entry.attachments = append(entry.attachments, event.Attachments...)
+				entry.attachments = append(entry.attachments, inlineAtts...)
 				s.entries.Store(key, entry)
 			}
 		}
@@ -307,6 +322,18 @@ func (s *pipelineService) advanceToAI(contactID, conversationID int64) {
 		return
 	}
 
+	// Media is best-effort: a failure here must not drop the turn's text reply
+	// (EVO-2180).
+	atts, err := s.debounce.GetAttachments(ctx, contactID, conversationID)
+	if err != nil {
+		slog.Warn("pipeline.debounce.get_attachments_failed",
+			"contact_id", contactID,
+			"conversation_id", conversationID,
+			"error", err,
+		)
+		atts = nil
+	}
+
 	newState := &model.PipelineState{Stage: model.StageAI, CreatedAt: time.Now()}
 	if err := s.repo.SetState(ctx, contactID, conversationID, newState); err != nil {
 		slog.Error("pipeline.debounce.set_ai_state_failed",
@@ -322,13 +349,13 @@ func (s *pipelineService) advanceToAI(contactID, conversationID int64) {
 		"conversation_id", conversationID,
 		"buffer_len", len(buffer),
 	)
-	s.launchAIStage(contactID, conversationID, buffer)
+	s.launchAIStage(contactID, conversationID, buffer, atts)
 }
 
 // launchAIStage launches the AI goroutine with the stored pipeline context.
 // Must be called only after pipelineEntry is stored in s.entries (guaranteed by
 // startDebounce/skipDebounce/advanceToAI).
-func (s *pipelineService) launchAIStage(contactID, conversationID int64, buffer string) {
+func (s *pipelineService) launchAIStage(contactID, conversationID int64, buffer string, atts []model.Attachment) {
 	key := pairKey(contactID, conversationID)
 	v, ok := s.entries.Load(key)
 	if !ok {
@@ -347,12 +374,12 @@ func (s *pipelineService) launchAIStage(contactID, conversationID int64, buffer 
 		)
 		return
 	}
-	go s.runAIStage(entry.ctx, contactID, conversationID, buffer, entry.cfg, entry.postbackURL)
+	go s.runAIStage(entry.ctx, contactID, conversationID, buffer, atts, entry.cfg, entry.postbackURL)
 }
 
 // runAIStage is the AI stage goroutine body. ctx is pipelineEntry.ctx — cancelled by
 // Process when a new message arrives for the same pair.
-func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversationID int64, buffer string, cfg model.BotConfig, postbackURL string) {
+func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversationID int64, buffer string, atts []model.Attachment, cfg model.BotConfig, postbackURL string) {
 	defer s.recoverPipeline(contactID, conversationID)
 
 	slog.Info("pipeline.ai.started",
@@ -375,12 +402,18 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 		}
 	}
 
-	a2aAttachments := make([]aiModel.A2AAttachment, 0, len(attachments))
-	for _, att := range attachments {
-		a2aAttachments = append(a2aAttachments, aiModel.A2AAttachment{
-			Name:        att.Name,
-			ContentType: att.ContentType,
-			Data:        att.Data,
+	// Hybrid media (ENIA union): base64 attachments ride in-memory on the
+	// pipelineEntry (never Redis), URL attachments ride the debounce repo
+	// (EVO-2180). The adapter prefers Data and downloads URL otherwise.
+	combined := append(append([]model.Attachment(nil), attachments...), atts...)
+	aiAttachments := make([]aiModel.Attachment, 0, len(combined))
+	for _, a := range combined {
+		aiAttachments = append(aiAttachments, aiModel.Attachment{
+			Name:        a.Name,
+			URL:         a.URL,
+			ContentType: a.ContentType,
+			FileType:    a.FileType,
+			Data:        a.Data,
 		})
 	}
 
@@ -390,8 +423,8 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 		ConversationID: conversationID,
 		ApiKey:         apiKey,
 		Message:        buffer,
-		Attachments:    a2aAttachments,
 		Metadata:       metadata,
+		Attachments:    aiAttachments,
 	})
 	if err != nil {
 		switch {
@@ -447,12 +480,12 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 
 // launchDispatchStage launches the dispatch goroutine.
 func (s *pipelineService) launchDispatchStage(
-	ctx            context.Context,
-	contactID      int64,
+	ctx context.Context,
+	contactID int64,
 	conversationID int64,
-	resp           *aiModel.NormalizedResponse,
-	cfg            model.BotConfig,
-	postbackURL    string,
+	resp *aiModel.NormalizedResponse,
+	cfg model.BotConfig,
+	postbackURL string,
 ) {
 	go s.runDispatchStage(ctx, contactID, conversationID,
 		resp.Content, resp.AudioURL, resp.AudioMimeType, resp.AudioData, resp.AudioReplacesText,
@@ -476,7 +509,7 @@ func (s *pipelineService) runDispatchStage(
 	defer s.recoverPipeline(contactID, conversationID)
 
 	slog.Info("pipeline.dispatch.started",
-		"contact_id",      contactID,
+		"contact_id", contactID,
 		"conversation_id", conversationID,
 		"has_audio",       audioURL != "" || audioData != "",
 		"replaces_text",   audioReplacesText,
@@ -494,14 +527,14 @@ func (s *pipelineService) runDispatchStage(
 			// atomically. A Delete here would race with the new event's Store
 			// and could delete the replacement entry.
 			slog.Info("pipeline.dispatch.cancelled",
-				"contact_id",      contactID,
+				"contact_id", contactID,
 				"conversation_id", conversationID,
 			)
 		default:
 			slog.Error("pipeline.dispatch.error",
-				"contact_id",      contactID,
+				"contact_id", contactID,
 				"conversation_id", conversationID,
-				"error",           err,
+				"error", err,
 			)
 			s.clearStateWithLog(contactID, conversationID)
 		}
@@ -514,9 +547,9 @@ func (s *pipelineService) runDispatchStage(
 	doneCtx, doneCancel := cleanupCtx()
 	if err := s.repo.SetState(doneCtx, contactID, conversationID, doneState); err != nil {
 		slog.Warn("pipeline.dispatch.set_done_failed",
-			"contact_id",      contactID,
+			"contact_id", contactID,
 			"conversation_id", conversationID,
-			"error",           err,
+			"error", err,
 		)
 	}
 	doneCancel()
@@ -524,9 +557,9 @@ func (s *pipelineService) runDispatchStage(
 	s.entries.Delete(pairKey(contactID, conversationID))
 
 	slog.Info("pipeline.dispatch.completed",
-		"contact_id",      contactID,
+		"contact_id", contactID,
 		"conversation_id", conversationID,
-		"duration",        dur.String(),
+		"duration", dur.String(),
 	)
 }
 
@@ -674,4 +707,18 @@ func parsePairKey(key string) (contactID, conversationID int64) {
 	contactID, _ = strconv.ParseInt(parts[0], 10, 64)
 	conversationID, _ = strconv.ParseInt(parts[1], 10, 64)
 	return
+}
+
+// splitAttachments separates ENIA inline attachments (Data set — base64 bytes
+// must never be written to Redis) from URL attachments, which are persisted in
+// the debounce repo (EVO-2180) and survive a restart.
+func splitAttachments(atts []model.Attachment) (inline, urlBased []model.Attachment) {
+	for _, a := range atts {
+		if a.Data != "" {
+			inline = append(inline, a)
+		} else {
+			urlBased = append(urlBased, a)
+		}
+	}
+	return inline, urlBased
 }
