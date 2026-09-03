@@ -734,7 +734,7 @@ func (s *pipelineService) sendAIFailureNotice(
 	defer cancel()
 	defer s.recoverPipeline(contactID, conversationID)
 
-	if err := s.dispatchEng.Dispatch(ctx, contactID, conversationID, notice, cfg, postbackURL); err != nil {
+	if err := s.dispatchEng.Dispatch(ctx, contactID, conversationID, notice, "", "", "", false, cfg, postbackURL); err != nil { // ENIA: aviso é só texto (sem áudio) — assinatura do voice-flow
 		slog.Warn("pipeline.ai.failure_notice.failed",
 			"contact_id", contactID,
 			"conversation_id", conversationID,

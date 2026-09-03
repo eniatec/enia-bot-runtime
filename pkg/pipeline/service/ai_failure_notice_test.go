@@ -19,7 +19,7 @@ func captureDispatch(t *testing.T) (*mockDispatchEngine, *[]string) {
 	t.Helper()
 	var sent []string
 	engine := &mockDispatchEngine{
-		dispatchFn: func(_ context.Context, _, _ int64, content string, _ model.BotConfig, _ string) error {
+		dispatchFn: func(_ context.Context, _, _ int64, content string, _, _, _ string, _ bool, _ model.BotConfig, _ string) error {
 			sent = append(sent, content)
 			return nil
 		},
